@@ -2,7 +2,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
-import { Civitai, Scheduler } from 'civitai'; // Import Civitai SDK
+import pkg from 'civitai'; // Import Civitai SDK using default import
+const { Civitai, Scheduler } = pkg; // Destructure needed exports
 import { z } from 'zod'; // For input validation
 
 // Define the input type directly from the inline schema in server.tool
