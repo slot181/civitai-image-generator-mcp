@@ -6,6 +6,9 @@ import pkg from 'civitai'; // Import Civitai SDK using default import
 const { Civitai, Scheduler } = pkg; // Destructure needed exports
 import { z } from 'zod'; // For input validation
 
+// Helper function for delaying execution
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
 // Remove the explicit GenerateImageArgs type definition as it's causing issues.
 // Let TypeScript infer the 'params' type in the callback directly from the schema.
 // type GenerateImageArgs = z.infer<typeof GenerateImageInputSchema>;
@@ -43,7 +46,7 @@ class CivitaiImageGenerationServer {
   private setupToolHandlers() {
     this.server.tool(
       'generate_image',
-      // Define schema directly as an object literal (ZodRawShape)
+      // Define schema directly - REMOVE 'wait' parameter
       {
         prompt: z.string().describe('Text prompt for image generation'),
         model: z.string().describe('The Civitai model URN to use (e.g., urn:air:sd1:checkpoint:civitai:4201@130072)'),
@@ -56,90 +59,108 @@ class CivitaiImageGenerationServer {
         seed: z.number().int().optional().describe('Seed for the image generation process. -1 for random.'),
         clipSkip: z.number().int().min(1).max(10).optional().default(2).describe('Number of CLIP skips (1-10)'),
         additionalNetworks: z.record(z.string(), z.object({ strength: z.number().optional(), triggerWord: z.string().optional() })).optional().describe('Additional networks (LoRA, VAE, etc.) keyed by URN'),
-        wait: z.boolean().optional().default(true).describe('Wait for the job to complete before returning (long polling)')
+        // 'wait' parameter removed
       },
-      // Remove explicit type annotation ': GenerateImageArgs'. Let TS infer it.
+      // Refactored callback using polling
       async (params) => {
-        console.error(`[Civitai MCP] Received generate_image request with prompt: "${params.prompt}"`); // Log request start
+        console.error(`[Civitai MCP] Received generate_image request with prompt: "${params.prompt}"`);
 
-        const { wait, ...inputParams } = params; // Separate 'wait' from API params
+        // Prepare input for Civitai SDK (excluding 'wait')
+        const civitaiInput = {
+          model: params.model,
+          params: {
+            prompt: params.prompt,
+            negativePrompt: params.negativePrompt,
+            scheduler: params.scheduler,
+            steps: params.steps,
+            cfgScale: params.cfgScale,
+            width: params.width,
+            height: params.height,
+            seed: params.seed ?? -1,
+            clipSkip: params.clipSkip,
+          },
+          additionalNetworks: params.additionalNetworks,
+        };
 
+        let initialResponse;
         try {
-          // Prepare input for Civitai SDK
-          const civitaiInput = {
-            model: inputParams.model,
-            params: {
-              prompt: inputParams.prompt,
-              negativePrompt: inputParams.negativePrompt,
-              scheduler: inputParams.scheduler,
-              steps: inputParams.steps,
-              cfgScale: inputParams.cfgScale,
-              width: inputParams.width,
-              height: inputParams.height,
-              seed: inputParams.seed ?? -1, // Default seed to -1 if not provided
-              clipSkip: inputParams.clipSkip,
-            },
-            additionalNetworks: inputParams.additionalNetworks,
-            // controlNets: inputParams.controlNets, // Add later if needed
-            // quantity: inputParams.batchSize, // Map batchSize to quantity if needed
-          };
+          console.error('[Civitai MCP] Calling Civitai API (async)...');
+          // Always call with wait=false
+          initialResponse = await this.civitai.image.fromText(civitaiInput, false);
+          console.error('[Civitai MCP] Initial API response:', JSON.stringify(initialResponse, null, 2));
 
-          console.error('[Civitai MCP] Calling Civitai API...');
-          const response = await this.civitai.image.fromText(civitaiInput, wait); // response type depends on 'wait'
-          console.error('[Civitai MCP] Received API response:', JSON.stringify(response, null, 2));
-
-          if (wait) {
-            // --- Revised Logic based on latest understanding ---
-            // Assume the response structure *always* contains a 'jobs' array,
-            // even when wait=true. The job(s) inside should be completed.
-            const firstJob = response?.jobs?.[0]; // Access the first job in the 'jobs' array
-
-            if (firstJob?.result?.available && firstJob.result.blobUrl) {
-               console.error(`[Civitai MCP] Job completed. Image URL: ${firstJob.result.blobUrl}`);
-              return {
-                content: [{ type: 'text', text: `Image generated: ${firstJob.result.blobUrl}` }],
-              };
-            } else {
-                // Log the actual response structure for debugging if URL extraction fails
-                console.error('[Civitai MCP] Job completed but failed to extract image URL (wait=true). Response structure:', JSON.stringify(response));
-                // Provide a more specific error message based on the observed structure
-                let errorMsg = 'Civitai job completed (wait=true) but failed to extract image URL from the response structure.';
-                if (!response?.jobs) {
-                    errorMsg = 'Civitai job completed (wait=true) but the response did not contain a "jobs" array.';
-                } else if (!firstJob) {
-                    errorMsg = 'Civitai job completed (wait=true) but the "jobs" array was empty.';
-                } else if (!firstJob.result) {
-                     errorMsg = 'Civitai job completed (wait=true) but the first job did not contain a "result" object.';
-                } else if (!firstJob.result.available) {
-                     errorMsg = 'Civitai job completed (wait=true) but the result is marked as unavailable.';
-                } else if (!firstJob.result.blobUrl) {
-                     errorMsg = 'Civitai job completed (wait=true) but the result did not contain a "blobUrl".';
-                }
-                throw new McpError(ErrorCode.InternalError, errorMsg);
-            }
-          } else {
-            // If not waited, response contains token and initial job status
-             if (response.token) {
-                console.error(`[Civitai MCP] Job submitted. Token: ${response.token}`);
-                return {
-                  content: [{ type: 'text', text: `Civitai job submitted. Token: ${response.token}. Use civitai.jobs.getByToken to check status.` }],
-                };
-            } else {
-                console.error('[Civitai MCP] Job submission failed or did not return a token (wait=false). Response:', JSON.stringify(response));
-                throw new McpError(ErrorCode.InternalError, 'Civitai job submission did not return a token (wait=false).');
-            }
+          if (!initialResponse?.token) {
+            console.error('[Civitai MCP] Job submission failed or did not return a token.');
+            throw new McpError(ErrorCode.InternalError, 'Civitai job submission did not return a token.');
           }
 
         } catch (error: any) {
-          console.error('[Civitai MCP] API Error:', error);
-          // Try to extract a meaningful error message
-          const errorMessage = error?.message || 'Unknown error calling Civitai API';
+          console.error('[Civitai MCP] Initial API Error:', error);
+          const errorMessage = error?.message || 'Unknown error submitting job to Civitai API';
           const errorDetails = error?.response?.data ? JSON.stringify(error.response.data) : '';
           return {
             content: [{ type: 'text', text: `Civitai API Error: ${errorMessage}${errorDetails ? ` (${errorDetails})` : ''}` }],
             isError: true,
           };
         }
+
+        const jobToken = initialResponse.token;
+        console.error(`[Civitai MCP] Job submitted. Token: ${jobToken}. Starting polling...`);
+
+        // Polling logic
+        const pollIntervalMs = 2000; // Poll every 2 seconds
+        const timeoutMs = 2 * 60 * 1000; // 2 minute timeout
+        const startTime = Date.now();
+
+        while (Date.now() - startTime < timeoutMs) {
+          try {
+            console.error(`[Civitai MCP] Polling job status for token: ${jobToken}`);
+            const statusResponse = await this.civitai.jobs.getByToken(jobToken);
+            console.error('[Civitai MCP] Polling response:', JSON.stringify(statusResponse, null, 2));
+
+            const firstJob = statusResponse?.jobs?.[0];
+
+            if (firstJob?.result?.available) {
+              if (firstJob.result.blobUrl) {
+                console.error(`[Civitai MCP] Job completed. Image URL: ${firstJob.result.blobUrl}`);
+                return {
+                  content: [{ type: 'text', text: `Image generated: ${firstJob.result.blobUrl}` }],
+                };
+              } else {
+                // Job is available but no URL? This might indicate an error state in Civitai.
+                 console.error('[Civitai MCP] Job available but blobUrl missing. Treating as error.');
+                 throw new McpError(ErrorCode.InternalError, 'Civitai job completed but the result did not contain an image URL.');
+              }
+            } else if (firstJob && !firstJob.scheduled && !firstJob.result?.available) {
+                 // If not scheduled and not available, it might have failed without an explicit error earlier
+                 console.error('[Civitai MCP] Job is no longer scheduled but result is not available. Assuming failure.');
+                 throw new McpError(ErrorCode.InternalError, 'Civitai job failed or finished without an available result.');
+            }
+
+            // If still processing (scheduled or result not available yet), wait and poll again
+            console.error('[Civitai MCP] Job still processing, waiting...');
+            await delay(pollIntervalMs);
+
+          } catch (pollError: any) {
+            // Handle errors during polling itself
+            console.error('[Civitai MCP] Polling Error:', pollError);
+             // If it's an McpError we threw, re-throw it
+            if (pollError instanceof McpError) {
+                throw pollError;
+            }
+            // Otherwise, wrap it
+            const errorMessage = pollError?.message || 'Unknown error during job status polling';
+             return {
+                content: [{ type: 'text', text: `Polling Error: ${errorMessage}` }],
+                isError: true,
+             };
+          }
+        }
+
+        // If loop finishes without returning, it's a timeout
+        console.error('[Civitai MCP] Polling timed out.');
+        // Use InternalError as Timeout is not a standard MCP ErrorCode
+        throw new McpError(ErrorCode.InternalError, `Polling timed out: Civitai job did not complete within the ${timeoutMs / 1000} second limit.`);
       }
     );
   }
