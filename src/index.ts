@@ -89,29 +89,33 @@ class CivitaiImageGenerationServer {
           console.error('[Civitai MCP] Received API response:', JSON.stringify(response, null, 2));
 
           if (wait) {
-            // If waited, assume 'response' is the completed job object (or array if batch > 1)
-            // For now, assume batchSize is 1, so response is a single job object.
-            // TODO: Verify the actual return structure for wait=true from Civitai SDK.
-            const jobResult = response as any; // Cast to any for now due to uncertainty
+            // --- Revised Logic based on latest understanding ---
+            // Assume the response structure *always* contains a 'jobs' array,
+            // even when wait=true. The job(s) inside should be completed.
+            const firstJob = response?.jobs?.[0]; // Access the first job in the 'jobs' array
 
-            if (jobResult?.result?.available && jobResult.result.blobUrl) {
-               console.error(`[Civitai MCP] Job completed. Image URL: ${jobResult.result.blobUrl}`);
+            if (firstJob?.result?.available && firstJob.result.blobUrl) {
+               console.error(`[Civitai MCP] Job completed. Image URL: ${firstJob.result.blobUrl}`);
               return {
-                content: [{ type: 'text', text: `Image generated: ${jobResult.result.blobUrl}` }],
+                content: [{ type: 'text', text: `Image generated: ${firstJob.result.blobUrl}` }],
               };
             } else {
-              // Attempt to check if it's an array (batch > 1 case)
-              const firstJobInArray = Array.isArray(response) ? response[0] : null;
-              if (firstJobInArray?.result?.available && firstJobInArray.result.blobUrl) {
-                 console.error(`[Civitai MCP] Job completed (batch). Image URL: ${firstJobInArray.result.blobUrl}`);
-                 // Note: Returning only the first image URL for now if batch > 1
-                 return {
-                    content: [{ type: 'text', text: `Image generated: ${firstJobInArray.result.blobUrl}` }],
-                 };
-              } else {
-                console.error('[Civitai MCP] Job completed but no image URL found in response (wait=true). Response:', JSON.stringify(response));
-                throw new McpError(ErrorCode.InternalError, 'Civitai job completed (wait=true) but no image URL was returned.');
-              }
+                // Log the actual response structure for debugging if URL extraction fails
+                console.error('[Civitai MCP] Job completed but failed to extract image URL (wait=true). Response structure:', JSON.stringify(response));
+                // Provide a more specific error message based on the observed structure
+                let errorMsg = 'Civitai job completed (wait=true) but failed to extract image URL from the response structure.';
+                if (!response?.jobs) {
+                    errorMsg = 'Civitai job completed (wait=true) but the response did not contain a "jobs" array.';
+                } else if (!firstJob) {
+                    errorMsg = 'Civitai job completed (wait=true) but the "jobs" array was empty.';
+                } else if (!firstJob.result) {
+                     errorMsg = 'Civitai job completed (wait=true) but the first job did not contain a "result" object.';
+                } else if (!firstJob.result.available) {
+                     errorMsg = 'Civitai job completed (wait=true) but the result is marked as unavailable.';
+                } else if (!firstJob.result.blobUrl) {
+                     errorMsg = 'Civitai job completed (wait=true) but the result did not contain a "blobUrl".';
+                }
+                throw new McpError(ErrorCode.InternalError, errorMsg);
             }
           } else {
             // If not waited, response contains token and initial job status
