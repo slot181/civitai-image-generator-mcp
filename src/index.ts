@@ -6,32 +6,13 @@ import pkg from 'civitai'; // Import Civitai SDK using default import
 const { Civitai, Scheduler } = pkg; // Destructure needed exports
 import { z } from 'zod'; // For input validation
 
-// Define the input type directly from the inline schema in server.tool
-// (We need the type definition even if the schema constant is removed)
-type GenerateImageArgs = z.infer<z.ZodObject<{
-  prompt: z.ZodString;
-  model: z.ZodString;
-  negativePrompt: z.ZodOptional<z.ZodString>;
-  scheduler: z.ZodDefault<z.ZodOptional<z.ZodNativeEnum<typeof Scheduler>>>;
-  steps: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
-  cfgScale: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
-  width: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
-  height: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
-  seed: z.ZodOptional<z.ZodNumber>;
-  clipSkip: z.ZodDefault<z.ZodOptional<z.ZodNumber>>;
-  additionalNetworks: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodObject<{
-      strength: z.ZodOptional<z.ZodNumber>;
-      triggerWord: z.ZodOptional<z.ZodString>;
-  }, "strip", z.ZodTypeAny, { strength?: number | undefined; triggerWord?: string | undefined; }, { strength?: number | undefined; triggerWord?: string | undefined; }>>>;
-  wait: z.ZodDefault<z.ZodOptional<z.ZodBoolean>>;
-}, "strip", z.ZodTypeAny, { prompt: string; model: string; negativePrompt?: string | undefined; scheduler: Scheduler; steps: number; cfgScale: number; width: number; height: number; seed?: number | undefined; clipSkip: number; additionalNetworks?: Record<string, { strength?: number | undefined; triggerWord?: string | undefined; }> | undefined; wait: boolean; }, { prompt: string; model: string; negativePrompt?: string | undefined; scheduler?: Scheduler | undefined; steps?: number | undefined; cfgScale?: number | undefined; width?: number | undefined; height?: number | undefined; seed?: number | undefined; clipSkip?: number | undefined; additionalNetworks?: Record<string, { strength?: number | undefined; triggerWord?: string | undefined; }> | undefined; wait?: boolean | undefined; }>>;
-
-// Type for validated arguments - Now defined above using z.infer on the inline shape
+// Remove the explicit GenerateImageArgs type definition as it's causing issues.
+// Let TypeScript infer the 'params' type in the callback directly from the schema.
 // type GenerateImageArgs = z.infer<typeof GenerateImageInputSchema>;
 
 class CivitaiImageGenerationServer {
   private readonly server: McpServer;
-  private readonly civitai: Civitai;
+  private readonly civitai: InstanceType<typeof Civitai>; // Use InstanceType<typeof Class> for instance type
   private readonly apiKey: string;
 
   constructor(apiKey: string) {
@@ -77,7 +58,8 @@ class CivitaiImageGenerationServer {
         additionalNetworks: z.record(z.string(), z.object({ strength: z.number().optional(), triggerWord: z.string().optional() })).optional().describe('Additional networks (LoRA, VAE, etc.) keyed by URN'),
         wait: z.boolean().optional().default(true).describe('Wait for the job to complete before returning (long polling)')
       },
-      async (params: GenerateImageArgs) => {
+      // Remove explicit type annotation ': GenerateImageArgs'. Let TS infer it.
+      async (params) => {
         console.error(`[Civitai MCP] Received generate_image request with prompt: "${params.prompt}"`); // Log request start
 
         const { wait, ...inputParams } = params; // Separate 'wait' from API params
