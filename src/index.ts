@@ -5,6 +5,11 @@ import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import pkg from 'civitai'; // Import Civitai SDK using default import
 const { Civitai, Scheduler } = pkg; // Destructure needed exports
 import { z } from 'zod'; // For input validation
+import axios from 'axios'; // For downloading images
+import path from 'path'; // For handling file paths
+import { mkdir, writeFile, access } from 'fs/promises'; // For directory/file operations
+import { constants as fsConstants } from 'fs'; // For access check constants
+import { randomUUID } from 'crypto'; // For unique filenames
 
 // Helper function for delaying execution
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -17,12 +22,20 @@ class CivitaiImageGenerationServer {
   private readonly server: McpServer;
   private readonly civitai: InstanceType<typeof Civitai>; // Use InstanceType<typeof Class> for instance type
   private readonly apiKey: string;
+  private readonly modelId: string; // Add modelId member
+private readonly outputDir: string; // Add outputDir member
 
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
+constructor(apiKey: string, modelId: string, outputDir: string) { // Add outputDir to constructor
+  this.apiKey = apiKey;
+  this.modelId = modelId; // Store modelId
+  this.outputDir = path.resolve(outputDir); // Store and resolve outputDir
+    this.modelId = modelId; // Store modelId
 
     if (!this.apiKey) {
-      throw new Error('CIVITAI_API_TOKEN environment variable is required');
+      throw new Error('CIVITAI_API_TOKEN environment variable is required.');
+    }
+    if (!this.modelId) { // Add check for modelId
+        throw new Error('CIVITAI_MODEL_ID environment variable is required.');
     }
 
     this.civitai = new Civitai({ auth: this.apiKey });
@@ -49,7 +62,7 @@ class CivitaiImageGenerationServer {
       // Define schema directly - REMOVE 'wait' parameter
       {
         prompt: z.string().describe('Text prompt for image generation'),
-        model: z.string().describe('The Civitai model URN to use (e.g., urn:air:sd1:checkpoint:civitai:4201@130072)'),
+        // model parameter removed - will use environment variable
         negativePrompt: z.string().optional().describe('The negative prompt for the image generation'),
         scheduler: z.nativeEnum(Scheduler).optional().default(Scheduler.EULER_A).describe('The scheduler algorithm to use'),
         steps: z.number().int().min(1).max(100).optional().default(20).describe('Number of inference steps (1-100)'),
@@ -67,7 +80,7 @@ class CivitaiImageGenerationServer {
 
         // Prepare input for Civitai SDK (excluding 'wait')
         const civitaiInput = {
-          model: params.model,
+          model: this.modelId, // Use stored modelId from environment variable
           params: {
             prompt: params.prompt,
             negativePrompt: params.negativePrompt,
@@ -121,11 +134,21 @@ class CivitaiImageGenerationServer {
             const firstJob = statusResponse?.jobs?.[0];
 
             if (firstJob?.result?.available) {
-              if (firstJob.result.blobUrl) {
-                console.error(`[Civitai MCP] Job completed. Image URL: ${firstJob.result.blobUrl}`);
-                return {
-                  content: [{ type: 'text', text: `Image generated: ${firstJob.result.blobUrl}` }],
-                };
+              const imageUrl = firstJob.result.blobUrl;
+              if (imageUrl) {
+                console.error(`[Civitai MCP] Job completed. Image URL: ${imageUrl}`);
+                // Download and save the image
+                try {
+                  const localPath = await this.downloadAndSaveImage(imageUrl);
+                  console.error(`[Civitai MCP] Image saved locally to: ${localPath}`);
+                  // Return only the path as requested
+                  return {
+                    content: [{ type: 'text', text: JSON.stringify({ path: localPath }) }],
+                  };
+                } catch (downloadError: any) {
+                   console.error(`[Civitai MCP] Failed to download or save image: ${downloadError.message}`);
+                   throw new McpError(ErrorCode.InternalError, `Failed to download or save image from ${imageUrl}: ${downloadError.message}`);
+                }
               } else {
                 // Job is available but no URL? This might indicate an error state in Civitai.
                  console.error('[Civitai MCP] Job available but blobUrl missing. Treating as error.');
@@ -165,10 +188,32 @@ class CivitaiImageGenerationServer {
     );
   }
 
+  // Helper to ensure directory exists
+  private async ensureDirectoryExists(dirPath: string): Promise<void> {
+    try {
+      await access(dirPath, fsConstants.F_OK);
+    } catch {
+      console.error(`[Civitai MCP] Creating output directory: ${dirPath}`);
+      await mkdir(dirPath, { recursive: true });
+    }
+  }
+
+  // Helper to download and save image
+  private async downloadAndSaveImage(imageUrl: string): Promise<string> {
+    await this.ensureDirectoryExists(this.outputDir);
+    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+    const imageBuffer = Buffer.from(response.data, 'binary');
+    const filename = `civitai_${randomUUID()}.png`; // Use PNG as it's common for Civitai
+    const localPath = path.join(this.outputDir, filename);
+    await writeFile(localPath, imageBuffer);
+    return localPath;
+  }
+
+
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Civitai Image Generation MCP server running on stdio');
+    console.error(`Civitai Image Generation MCP server running. Output directory: ${this.outputDir}`);
   }
 }
 
@@ -194,14 +239,21 @@ const cliArgs = parseCliArgs(process.argv);
 // --- Configuration Loading ---
 // Prioritize command-line args (-e), fall back to environment variables
 const API_KEY = cliArgs.CIVITAI_API_TOKEN || process.env.CIVITAI_API_TOKEN;
+const MODEL_ID = cliArgs.CIVITAI_MODEL_ID || process.env.CIVITAI_MODEL_ID; // Read MODEL_ID
+const OUTPUT_DIR = cliArgs.CIVITAI_OUTPUT_DIR || process.env.CIVITAI_OUTPUT_DIR || './civitai_output'; // Read OUTPUT_DIR with default
 
 if (!API_KEY) {
   console.error('Error: CIVITAI_API_TOKEN environment variable is required.');
   process.exit(1); // Exit if API key is missing
 }
+if (!MODEL_ID) { // Add check for MODEL_ID
+    console.error('Error: CIVITAI_MODEL_ID environment variable is required.');
+    process.exit(1); // Exit if Model ID is missing
+}
+// No need to exit if OUTPUT_DIR is missing, as we have a default.
 
 // Create and run server
-const serverInstance = new CivitaiImageGenerationServer(API_KEY);
+const serverInstance = new CivitaiImageGenerationServer(API_KEY, MODEL_ID, OUTPUT_DIR); // Pass MODEL_ID and OUTPUT_DIR
 serverInstance.start().catch(error => {
   console.error('Failed to start server:', error);
   process.exit(1);
